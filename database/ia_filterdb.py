@@ -87,7 +87,7 @@ async def save_file(bot, media):
                 file_size=media.file_size,
                 file_type=media.file_type,
                 mime_type=media.mime_type,
-                caption=media.caption.html if media.caption else None,
+                caption=file_name,
             )
             await file.commit()
             print(f'Saved to {target_db.__name__}: {file_name}')
