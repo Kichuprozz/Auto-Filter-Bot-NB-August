@@ -1,3 +1,4 @@
+import logging
 from struct import pack
 import re
 import base64
@@ -10,18 +11,14 @@ from marshmallow.exceptions import ValidationError
 from info import *
 from utils import get_settings, save_group_settings
 from collections import defaultdict
-from datetime import datetime, timedelta
-from logging_helper import LOGGER
 
 
-_db_stats_cache_primary = {
-    "timestamp": None,
-    "primary_size": 0
-}
-_db_stats_cache_secondary = {
-    "timestamp": None,
-    "primary_size": 0
-}
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+processed_movies = set()
+
+MONGODB_SIZE_LIMIT = (512 * 1024 * 1024) - (80 * 1024 * 1024) 
 
 client = AsyncIOMotorClient(DATABASE_URI)
 db = client[DATABASE_NAME]
@@ -58,67 +55,49 @@ class Media2(Document):
         indexes = ('$file_name', )
         collection_name = COLLECTION_NAME
 
-async def check_db_size(db, cache):
+async def check_db_size(db):
     try:
-        now = datetime.utcnow()
-        cache_stale = cache["timestamp"] is None or \
-                      (now - cache["timestamp"] > timedelta(minutes=10))
-        if not cache_stale:
-            return cache["primary_size"]
-        dbstats = await db.command("dbStats")
-        db_size = dbstats['dataSize'] + dbstats['indexSize']
-        db_size_mb = db_size / (1024 * 1024) 
-        cache["primary_size"] = db_size_mb
-        cache["timestamp"] = now
-        return db_size_mb
+        stats = await db.command("dbstats")
+        return stats["dataSize"]
     except Exception as e:
-        LOGGER.error(f"Error Checking Database Size: {e}")
-        return 0 
-    
-async def save_file(media):
-    file_id, file_ref = unpack_new_file_id(media.file_id)
-    file_name = re.sub(r"[_\-\.#+$%^&*()!~`,;:\"'?/<>\[\]{}=|\\]", " ", str(media.file_name))
-    file_name = re.sub(r"\s+", " ", file_name).strip()    
-    primary_db_size = await check_db_size(db, _db_stats_cache_primary)
-    use_secondary = False
-    saveMedia = Media
-    exists_in_primary = await Media.count_documents({'file_id': file_id}, limit=1)
-    if exists_in_primary:
-        LOGGER.info(f'{file_name} Is Already Saved In Primary Database!')
-        return False, 0
-        
-    if MULTIPLE_DB and primary_db_size >= DB_CHANGE_LIMIT:
-        LOGGER.info("Primary Database Is Low On Space. Switching To Secondary DB.")
-        saveMedia = Media2
-        use_secondary = True
-        exists_in_secondary = await Media2.count_documents({'file_id': file_id}, limit=1)
-        if exists_in_secondary:
-            LOGGER.info(f'{file_name} Is Already Saved In Secondary Database!')
-            return False, 0
-            
+        logger.error(f"Database size check error: {e}")
+        return 0
+         
+async def save_file(bot, media):
     try:
-        file = saveMedia(
-            file_id=file_id,
-            file_ref=file_ref,
-            file_name=file_name,
-            file_size=media.file_size,
-            file_type=media.file_type,
-            mime_type=media.mime_type,
-            caption=media.caption.html if media.caption else None,
-        )
-    except ValidationError as e:
-        LOGGER.error(f'Validation Error While Saving File: {e}')
-        return False, 2
-    else:
-        try:
-            await file.commit()
-        except DuplicateKeyError:
-            LOGGER.error(f'{file_name} Is Already Saved In {"Secondary" if use_secondary else "Primary"} Database')
+        file_id, file_ref = unpack_new_file_id(media.file_id)
+        file_name = re.sub(r"[^\w\s.-]", " ", str(media.file_name)).strip()       
+        if await Media.count_documents({'file_id': file_id}, limit=1):
+            print(f'{file_name} exists in primary DB')
             return False, 0
-        else:
-            LOGGER.info(f'{file_name} Saved Successfully In {"Secondary" if use_secondary else "Primary"} Database')
+        target_db = Media
+        if MULTIPLE_DB:
+            primary_size = await check_db_size(db)
+            if primary_size >= MONGODB_SIZE_LIMIT:
+                print("Using secondary database")
+                target_db = Media2
+                if await Media2.count_documents({'file_id': file_id}, limit=1):
+                    print(f'{file_name} exists in secondary DB')
+                    return False, 0
+        try:
+            file = target_db(
+                file_id=file_id,
+                file_ref=file_ref,
+                file_name=file_name,
+                file_size=media.file_size,
+                file_type=media.file_type,
+                mime_type=media.mime_type,
+                caption=media.caption.html if media.caption else None,
+            )
+            await file.commit()
+            print(f'Saved to {target_db.__name__}: {file_name}')
             return True, 1
-            
+        except DuplicateKeyError:
+            print(f'Duplicate file: {file_name}')
+            return False, 0
+    except Exception as e:
+        print(f'Save error: {e}')
+        return False, 2
 
 async def get_search_results(chat_id, query, file_type=None, max_results=10, offset=0, filter=False):
     if chat_id is not None:
@@ -134,9 +113,9 @@ async def get_search_results(chat_id, query, file_type=None, max_results=10, off
     if not query:
         raw_pattern = '.'
     elif ' ' not in query:
-        raw_pattern = r"(\b|[\.\+\-_])" + query + r"(\b|[\.\+\-_])"
+        raw_pattern = r'(\b|[\.\+\-_])' + query + r'(\b|[\.\+\-_])'
     else:
-        raw_pattern = query.replace(" ", r".*[\s\.\+\-_()\[\]]")
+        raw_pattern = query.replace(' ', r'.*[\s\.\+\-_()]')
 
     try:
         regex = re.compile(raw_pattern, flags=re.IGNORECASE)
@@ -173,9 +152,9 @@ async def get_bad_files(query, file_type=None):
     if not query:
         raw_pattern = '.'
     elif ' ' not in query:
-        raw_pattern = r"(\b|[\.\+\-_])" + query + r"(\b|[\.\+\-_])"
+        raw_pattern = r'(\b|[\.\+\-_])' + query + r'(\b|[\.\+\-_])'
     else:
-        raw_pattern = query.replace(" ", r".*[\s\.\+\-_()]")
+        raw_pattern = query.replace(' ', r'.*[\s\.\+\-_()]')
     try:
         regex = re.compile(raw_pattern, flags=re.IGNORECASE)
     except:
@@ -242,7 +221,7 @@ async def siletxbotz_fetch_media(limit: int) -> List[dict]:
     try:
         if MULTIPLE_DB:
             db_size = await check_db_size(Media)
-            if db_size > DB_CHANGE_LIMIT:
+            if db_size > MONGODB_SIZE_LIMIT:
                 cursor = Media2.find().sort("$natural", -1).limit(limit)
                 files = await cursor.to_list(length=limit)
                 return files
@@ -250,7 +229,7 @@ async def siletxbotz_fetch_media(limit: int) -> List[dict]:
         files = await cursor.to_list(length=limit)
         return files
     except Exception as e:
-        LOGGER.error(f"Error in siletxbotz_fetch_media: {e}")
+        logger.error(f"Error in siletxbotz_fetch_media: {e}")
         return []
 
 async def silentxbotz_clean_title(filename: str, is_series: bool = False) -> str:
@@ -268,7 +247,7 @@ async def silentxbotz_clean_title(filename: str, is_series: bool = False) -> str
                 return f"{title} S{int(season):02}"
         return re.sub(r"[._\-\[\]@()]+", " ", filename).strip().title()
     except Exception as e:
-        LOGGER.error(f"Error in truncate_title: {e}")
+        logger.error(f"Error in truncate_title: {e}")
         return filename
         
 async def siletxbotz_get_movies(limit: int = 20) -> List[str]:
@@ -286,7 +265,7 @@ async def siletxbotz_get_movies(limit: int = 20) -> List[str]:
                 break
         return sorted(list(results))[:limit]
     except Exception as e:
-        LOGGER.error(f"Error in siletxbotz_get_movies: {e}")
+        logger.error(f"Error in siletxbotz_get_movies: {e}")
         return []
 
 async def siletxbotz_get_series(limit: int = 30) -> Dict[str, List[int]]:
@@ -308,5 +287,5 @@ async def siletxbotz_get_series(limit: int = 30) -> Dict[str, List[int]]:
                 grouped[title].append(season)
         return {title: sorted(set(seasons))[:10] for title, seasons in grouped.items() if seasons}
     except Exception as e:
-        LOGGER.error(f"Error in siletxbotz_get_series: {e}")
+        logger.error(f"Error in siletxbotz_get_series: {e}")
         return []
