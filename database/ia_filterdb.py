@@ -63,7 +63,7 @@ async def check_db_size(db):
         logger.error(f"Database size check error: {e}")
         return 0
          
-async def save_file(media):
+async def save_file(bot, media):
     """Save file in database"""
 
     # TODO: Find better way to get same file_id for same media to avoid duplicates
