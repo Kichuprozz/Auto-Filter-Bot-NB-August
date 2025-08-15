@@ -63,7 +63,7 @@ async def check_db_size(db, cache):
         if not cache_stale:
             return cache["primary_size"]
         dbstats = await db.command("dbStats")
-        db_size = dbstats['dataSize'] 
+        db_size = dbstats['indexSize'] 
         db_size_mb = db_size / (1024 * 1024) 
         cache["primary_size"] = db_size_mb
         cache["timestamp"] = now
