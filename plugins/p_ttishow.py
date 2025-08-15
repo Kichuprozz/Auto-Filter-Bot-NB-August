@@ -169,7 +169,7 @@ async def get_stats(bot, message):
         file1 = await Media.count_documents()
         DB_SIZE = 512 * 1024 * 1024
         dbstats = await db_stats.command("dbStats")
-        db_size = dbstats['dataSize'] 
+        db_size = (dbstats['dataSize']/(1024*1024))+(dbstats['indexSize']/(1024*1024))
         free = DB_SIZE - db_size
         uptime = get_readable_time(time() - botStartTime)
         ram = psutil.virtual_memory().percent
@@ -180,7 +180,7 @@ async def get_stats(bot, message):
             return
         file2 = await Media2.count_documents()
         db2stats = await db2_stats.command("dbStats")
-        db2_size = db2stats['dataSize'] 
+        db2_size = (db2stats['dataSize']/(1024*1024))+(db2stats['indexSize']/(1024*1024))
         free2 = DB_SIZE - db2_size
         await SilentXBotz.edit(script.MULTI_STATUS_TXT.format(
             total_users, totl_chats, premium, file1, get_size(db_size), get_size(free),
