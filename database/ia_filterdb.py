@@ -63,41 +63,37 @@ async def check_db_size(db):
         logger.error(f"Database size check error: {e}")
         return 0
          
-async def save_file(bot, media):
+async def save_file(media):
+    """Save file in database"""
+
+    # TODO: Find better way to get same file_id for same media to avoid duplicates
+    file_id, file_ref = unpack_new_file_id(media.file_id)
+    file_name = re.sub(r"(_|\-|\.|\+)", " ", str(media.file_name))
     try:
-        file_id, file_ref = unpack_new_file_id(media.file_id)
-        file_name = re.sub(r"[^\w\s.-]", " ", str(media.file_name)).strip()       
-        if await Media.count_documents({'file_id': file_id}, limit=1):
-            print(f'{file_name} exists in primary DB')
-            return False, 0
-        target_db = Media
-        if MULTIPLE_DB:
-            primary_size = await check_db_size(db)
-            if primary_size >= MONGODB_SIZE_LIMIT:
-                print("Using secondary database")
-                target_db = Media2
-                if await Media2.count_documents({'file_id': file_id}, limit=1):
-                    print(f'{file_name} exists in secondary DB')
-                    return False, 0
-        try:
-            file = target_db(
-                file_id=file_id,
-                file_ref=file_ref,
-                file_name=file_name,
-                file_size=media.file_size,
-                file_type=media.file_type,
-                mime_type=media.mime_type,
-                caption=media.caption.html if media.caption else None,
-            )
-            await file.commit()
-            print(f'Saved to {target_db.__name__}: {file_name}')
-            return True, 1
-        except DuplicateKeyError:
-            print(f'Duplicate file: {file_name}')
-            return False, 0
-    except Exception as e:
-        print(f'Save error: {e}')
+        file = Media(
+            file_id=file_id,
+            file_ref=file_ref,
+            file_name=file_name,
+            file_size=media.file_size,
+            file_type=media.file_type,
+            mime_type=media.mime_type,
+            caption=media.caption.html if media.caption else None,
+        )
+    except ValidationError:
+        logger.exception('Error occurred while saving file in database')
         return False, 2
+    else:
+        try:
+            await file.commit()
+        except DuplicateKeyError:      
+            logger.warning(
+                f'{getattr(media, "file_name", "NO_FILE")} is already saved in database'
+            )
+
+            return False, 0
+        else:
+            logger.info(f'{getattr(media, "file_name", "NO_FILE")} is saved to database')
+            return True, 1
 
 async def get_search_results(chat_id, query, file_type=None, max_results=10, offset=0, filter=False):
     if chat_id is not None:
